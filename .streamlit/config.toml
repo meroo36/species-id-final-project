@@ -1,0 +1,7 @@
+# Light theme: readable on a projector, and the diagrams are drawn for a light background.
+[theme]
+base = "light"
+primaryColor = "#2e7d5b"
+
+[browser]
+gatherUsageStats = false

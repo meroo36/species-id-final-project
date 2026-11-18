@@ -1,0 +1,159 @@
+x-app-env: &app-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-species}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-species}
+  POSTGRES_DB: ${POSTGRES_DB:-species_id}
+  DATA_DIR: /app/data
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  EXTRACTOR: ${EXTRACTOR:-mobilenetv3_large_100.ra_in1k}
+  ALLOWED_LICENSES: ${ALLOWED_LICENSES:-cc0,cc-by,cc-by-nc}
+  CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.6}
+  NEW_IMAGES_PER_RUN: ${NEW_IMAGES_PER_RUN:-20}
+  RETRAIN_MIN_NEW_PHOTOS: ${RETRAIN_MIN_NEW_PHOTOS:-1000}
+  AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+  AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-species}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-species}
+      POSTGRES_DB: ${POSTGRES_DB:-species_id}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sql:/docker-entrypoint-initdb.d/00_databases.sql:ro
+      - ./src/species_id/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-species} -d ${POSTGRES_DB:-species_id}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mlflow:
+    build: docker/mlflow
+    environment:
+      BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-species}:${POSTGRES_PASSWORD:-species}@postgres:5432/mlflow
+    ports:
+      - "${MLFLOW_PORT:-5001}:5000"   # 5000 is taken by AirPlay on macOS
+    volumes:
+      - mlartifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    environment:
+      <<: *app-env
+      AIRFLOW_URL: http://airflow:8080   # the Grafana webhook starts the training DAG
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/root/.cache/huggingface   # pre-trained extractor weights
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  airflow:
+    build: docker/airflow
+    environment:
+      <<: *app-env
+      API_URL: http://api:8000
+      PYTHONPATH: /opt/airflow/src
+      GIT_PYTHON_REFRESH: quiet
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-species}:${POSTGRES_PASSWORD:-species}@postgres:5432/airflow
+      # Basic auth lets the API trigger DAG runs through Airflow's REST API.
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --role Admin --username "$$AIRFLOW_ADMIN_USER" \
+          --password "$$AIRFLOW_ADMIN_PASSWORD" --firstname Admin --lastname User \
+          --email admin@example.com || true
+        airflow scheduler &
+        exec airflow webserver
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src:ro
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      POSTGRES_USER: ${POSTGRES_USER:-species}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-species}
+      POSTGRES_DB: ${POSTGRES_DB:-species_id}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - postgres
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/streamlit/Dockerfile
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  promdata:
+  grafanadata:
+  pgdata:
+  mlartifacts:
+  hf_cache:

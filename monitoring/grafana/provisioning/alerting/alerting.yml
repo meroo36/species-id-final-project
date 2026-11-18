@@ -1,0 +1,155 @@
+apiVersion: 1
+
+# Each rule: A = Prometheus query, B = last value, C = threshold.
+groups:
+  - orgId: 1
+    name: species-id
+    folder: Species ID
+    interval: 30s
+    rules:
+      - uid: high_review_rate
+        title: High human-review rate
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+          action: retrain          # the API webhook starts the training pipeline for this label
+        annotations:
+          summary: More than 30% of recent predictions were below the confidence threshold.
+          description: The model is unsure about what it is being shown. The training pipeline is triggered.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum(increase(species_predictions_total{needs_review="true"}[5m]))
+                / sum(increase(species_predictions_total[5m]))
+                and sum(increase(species_predictions_total[5m])) >= 20
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.3] }
+
+      - uid: slow_predictions
+        title: Slow predictions
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: 95th percentile latency of /predict is above 2 seconds.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                histogram_quantile(0.95,
+                sum(rate(http_request_duration_seconds_bucket{handler="/predict"}[5m])) by (le))
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [2] }
+
+      - uid: api_errors
+        title: API server errors
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5% of API requests are failing with a server error.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum(rate(http_requests_total{status="5xx"}[5m]))
+                / sum(rate(http_requests_total[5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.05] }
+
+      - uid: api_down
+        title: API down
+        condition: C
+        for: 1m
+        noDataState: Alerting
+        execErrState: Alerting
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus cannot scrape the model API.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: up{job="species-api"}
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+
+contactPoints:
+  - orgId: 1
+    name: species-api-webhook
+    receivers:
+      - uid: species_api_webhook
+        type: webhook
+        settings:
+          url: http://api:8000/webhooks/grafana
+          httpMethod: POST
+
+policies:
+  - orgId: 1
+    receiver: species-api-webhook
+    group_by: [alertname]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h
